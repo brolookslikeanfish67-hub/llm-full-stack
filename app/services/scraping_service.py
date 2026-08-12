@@ -1,78 +1,119 @@
 import logging
-from dataclasses import dataclass
-from typing import Optional
-from urllib.parse import urlparse
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
 
-import httpx
 from bs4 import BeautifulSoup
+from fastapi import FastAPI, HTTPException, status
+import httpx
+from pydantic import BaseModel, HttpUrl
 
+# --- Logging Setup ---
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("scraper_service")
 
 
-@dataclass(frozen=True)
-class ScrapingResult:
-    """Immutable data container for scraped document attributes."""
+# --- Schemas ---
+class ScrapeRequest(BaseModel):
+    url: HttpUrl
+    timeout: float = 10.0
+
+
+class ScrapeResponse(BaseModel):
     url: str
     title: str
-    text: str
-    status_code: int
+    content: str
+    word_count: int
 
 
-def scrape_website(
-    url: str,
-    timeout: float = 10.0,
-    headers: Optional[dict[str, str]] = None,
-) -> Optional[ScrapingResult]:
-    """Fetches a webpage, strips visual noise, and extracts clean plain text.
+# --- Service Layer ---
+class ScrapingService:
+    """Async web scraping service optimized for LLM ingestion."""
 
-    Args:
-        url: The web address to scrape.
-        timeout: Maximum request duration in seconds.
-        headers: Optional custom HTTP headers to override defaults.
-
-    Returns:
-        A ScrapingResult instance on success, or None on failure.
-    """
-    parsed = urlparse(url)
-    if not parsed.scheme or not parsed.netloc:
-        raise ValueError(f"Invalid HTTP/HTTPS URL: {url}")
-
-    default_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
+    NOISE_TAGS = {
+        "script",
+        "style",
+        "nav",
+        "footer",
+        "header",
+        "noscript",
+        "svg",
+        "form",
+        "aside",
     }
-    merged_headers = {**default_headers, **(headers or {})}
 
-    try:
-        with httpx.Client(follow_redirects=True, timeout=timeout) as client:
-            response = client.get(url, headers=merged_headers)
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        self.client = client
+
+    async def scrape_and_clean(self, url: str, timeout: float = 10.0) -> ScrapeResponse:
+        """Fetches a URL, strips DOM bloat, and returns structured LLM-ready text."""
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+        try:
+            response = await self.client.get(
+                url, headers=headers, timeout=timeout, follow_redirects=True
+            )
             response.raise_for_status()
-    except httpx.HTTPError as exc:
-        logger.error("HTTP error fetching %s: %s", url, exc)
-        return None
+        except httpx.HTTPStatusError as exc:
+            logger.warning("HTTP status error for %s: %s", url, exc)
+            raise HTTPException(
+                status_code=exc.response.status_code,
+                detail=f"Target server returned HTTP {exc.response.status_code}",
+            ) from exc
+        except httpx.RequestError as exc:
+            logger.error("Network error fetching %s: %s", url, exc)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Failed to connect to the target website",
+            ) from exc
 
-    # Parse DOM tree using 'lxml' for higher execution speed
-    soup = BeautifulSoup(response.content, "lxml")
+        soup = BeautifulSoup(response.content, "lxml")
 
-    # Decompose script, styling, and navigation bloat
-    unwanted_tags = ["script", "style", "nav", "footer", "header", "noscript", "svg", "form", "aside"]
-    for element in soup.find_all(unwanted_tags):
-        element.decompose()
+        for tag in soup.find_all(self.NOISE_TAGS):
+            tag.decompose()
 
-    title = soup.title.string.strip() if soup.title and soup.title.string else ""
-    
-    # Extract line-separated text and purge empty whitespace
-    lines = (line.strip() for line in soup.get_text(separator="\n").splitlines())
-    clean_text = "\n".join(line for line in lines if line)
+        title = soup.title.string.strip() if soup.title and soup.title.string else ""
+        lines = (line.strip() for line in soup.get_text(separator="\n").splitlines())
+        clean_text = "\n".join(line for line in lines if line)
 
-    return ScrapingResult(
-        url=str(response.url),
-        title=title,
-        text=clean_text,
-        status_code=response.status_code,
+        return ScrapeResponse(
+            url=str(response.url),
+            title=title,
+            content=clean_text,
+            word_count=len(clean_text.split()),
+        )
+
+
+# --- Lifespan Context Manager ---
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Manages application startup and shutdown tasks (HTTP client lifecycle)."""
+    app.state.http_client = httpx.AsyncClient(
+        limits=httpx.Limits(max_keepalive_connections=20, max_connections=100)
+    )
+    yield  # Pause execution during server runtime
+    await app.state.http_client.aclose()  # Trigger clean socket closure on app shutdown
+
+
+# --- FastAPI Application ---
+app = FastAPI(
+    title="LLM Web Scraping Ingestion API",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+@app.post("/api/v1/scrape", response_model=ScrapeResponse)
+async def scrape_endpoint(payload: ScrapeRequest) -> ScrapeResponse:
+    """Ingests a webpage and converts it into a clean format suitable for LLM contexts."""
+    scraper = ScrapingService(client=app.state.http_client)
+    return await scraper.scrape_and_clean(
+        url=payload.url.unicode_string(),
+        timeout=payload.timeout,
     )
